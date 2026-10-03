@@ -12,8 +12,14 @@ Open `index.html` directly, or drag & drop (or choose) your raw log file(s) to p
 - Top failing/blocked endpoints and top slowest endpoints
 - A sortable, filterable table of the most active/suspicious client IPs
 - Lightweight security-pattern detection (path traversal, SQLi/XSS probes, config-file scanning)
+- A **Custom Query** box: describe what you want in plain English (e.g. "list ARLs of 301s",
+  "top 10 client IPs", "how many requests were blocked") and it builds and runs the equivalent
+  AWK + pipeline command for you — a deterministic keyword/regex translator, not an LLM, so it's
+  free, instant, and never sends anything anywhere. An "Advanced" panel below it lets you write
+  AWK + `sort`/`uniq -c`/`head`/`tail`/`grep`/`wc -l` pipelines directly, if you'd rather.
 
-Loads with a synthetic sample dataset by default so you can see it working before uploading anything.
+Loads with a synthetic sample dataset by default so you can see it working before uploading anything
+(the Custom Query box requires an uploaded file, since the sample dataset doesn't ship raw log lines).
 
 ## Supported log format
 

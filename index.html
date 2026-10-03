@@ -251,6 +251,47 @@
     </table>
   </div>
 
+  <div class="card">
+    <h2>Custom Query <span id="queryBadge" class="badge" style="background:var(--gridline); color:var(--text-muted);">no file loaded</span></h2>
+    <p class="hint">
+      Describe what you want in plain English — this runs entirely in your browser via a small pattern-matcher
+      (no AI, no API calls, nothing leaves your machine). It maps common phrasings to fields it knows about
+      (ARL/URI, IP, status, method, host, reason, user-agent, latency) and shows you the exact AWK command it built,
+      which you can edit directly below.
+    </p>
+    <div class="filter-row">
+      <input id="nlInput" type="text" disabled
+        placeholder="e.g. &quot;List ARLs of 301s&quot;, &quot;top 10 client IPs&quot;, &quot;count by status&quot;, &quot;errors with reason&quot;…"
+        style="flex:1; padding:9px 12px; border-radius:7px; border:1px solid var(--border); background:var(--page-plane); color:var(--text-primary); font-size:13px;">
+      <button class="btn primary" id="nlTranslateBtn" disabled>Translate &amp; Run</button>
+    </div>
+    <div id="nlExplain" style="font-size:12px; margin:6px 0 2px; min-height:16px;"></div>
+
+    <details style="margin-top:10px;">
+      <summary>Advanced: write AWK + pipeline directly</summary>
+      <p class="hint" style="margin-top:10px;">
+        Supports <code>$1</code>…<code>$N</code>, <code>$0</code>, <code>$NF</code>, <code>NR</code>, <code>NF</code>,
+        <code>== != ~ !~ &lt; &lt;= &gt; &gt;= &amp;&amp; || !</code>, string concatenation, and <code>print</code>.
+        Pipe into <code>sort [-n -r -u]</code>, <code>uniq [-c]</code>, <code>head</code>/<code>tail</code> <code>[-N]</code>,
+        <code>grep [-v -i] PATTERN</code>, or <code>wc -l</code>.
+      </p>
+      <div class="filter-row" style="flex-wrap: wrap;">
+        <button class="btn" data-example="awk '$2==&quot;r&quot; {print $14}' | sort | uniq -c | sort -rn">status code tally</button>
+        <button class="btn" data-example="awk '$2==&quot;r&quot; && $15!=&quot;-&quot; {print $14 &quot;\t&quot; $15 &quot;\t&quot; $13}' | sort | uniq -c | sort -rn">errors + URI</button>
+        <button class="btn" data-example="awk '$2==&quot;r&quot; && $12==&quot;GET&quot; {print $11}' | sort | uniq -c | sort -rn | head -10">top GET client IPs</button>
+      </div>
+      <textarea id="queryInput" disabled rows="3" placeholder="Upload a log file above to enable custom queries…"
+        style="width:100%; font-family:ui-monospace,monospace; font-size:12.5px; padding:10px; border-radius:7px; border:1px solid var(--border); background:var(--page-plane); color:var(--text-primary); resize:vertical;"></textarea>
+    </details>
+    <div class="filter-row" style="margin-top:8px;">
+      <button class="btn primary" id="runQueryBtn" disabled>Run</button>
+      <button class="btn" id="clearQueryBtn">Clear</button>
+      <button class="btn" id="downloadQueryBtn" style="display:none;">Download full output (.txt)</button>
+      <span id="queryStatus" style="font-size:12px; color:var(--text-muted); align-self:center;"></span>
+    </div>
+    <pre id="queryOutput" style="margin-top:10px; max-height:320px; overflow:auto; font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; background:var(--page-plane); border:1px solid var(--border); border-radius:7px; padding:10px; white-space:pre-wrap; word-break:break-all;"></pre>
+  </div>
+
   <details>
     <summary>Raw aggregate data (status codes, security pattern hits, origin hosts)</summary>
     <div class="card" style="margin-top:8px;">
@@ -686,14 +727,258 @@ function renderAll(d) {
     .map(([k, v]) => `<tr><td>${k}</td><td style="font-variant-numeric:tabular-nums;">${v}</td></tr>`).join('');
 }
 
+/* ---------- Mini AWK-subset interpreter + shell-pipe simulator ---------- */
+/* Supports: $N field refs, $0, $NF, NR, NF, numeric/string literals,
+   == != ~ !~ < <= > >= && || !, string concatenation by juxtaposition,
+   a single `pattern {print ...}` rule. Pipeline stages after the awk
+   program: sort [-n -r -u], uniq [-c], head/tail [-N | -n N],
+   grep [-v -i] PATTERN, wc -l. Runs entirely client-side, no server. */
+
+function awkSplitTopLevel(str, sep) {
+  const parts = [];
+  let cur = '', quote = null;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote) { cur += c; if (c === quote) quote = null; }
+    else if (c === '"' || c === "'") { quote = c; cur += c; }
+    else if (c === sep) { parts.push(cur); cur = ''; }
+    else { cur += c; }
+  }
+  parts.push(cur);
+  return parts.map(s => s.trim()).filter(s => s.length);
+}
+function awkStripQuotes(s) {
+  s = s.trim();
+  if (s.length >= 2 && ((s[0] === "'" && s[s.length - 1] === "'") || (s[0] === '"' && s[s.length - 1] === '"'))) return s.slice(1, -1);
+  return s;
+}
+function awkTokenizeArgs(str) {
+  const out = [];
+  let cur = '', quote = null;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote) { if (c === quote) quote = null; else cur += c; }
+    else if (c === '"' || c === "'") quote = c;
+    else if (/\s/.test(c)) { if (cur.length) { out.push(cur); cur = ''; } }
+    else cur += c;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+function lexAwk(src) {
+  const tokens = []; let i = 0; const n = src.length;
+  const prevType = () => tokens.length ? tokens[tokens.length - 1].type : null;
+  while (i < n) {
+    const c = src[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '$') {
+      i++;
+      let m = /^\d+/.exec(src.slice(i));
+      if (m) { tokens.push({ type: 'FIELD', value: parseInt(m[0], 10) }); i += m[0].length; continue; }
+      let m2 = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+      if (m2) { tokens.push({ type: 'FIELDEXPR', value: m2[0] }); i += m2[0].length; continue; }
+      throw new Error('Expected field number or name after $');
+    }
+    if (c === '"') {
+      i++; let s = '';
+      while (i < n && src[i] !== '"') {
+        if (src[i] === '\\' && i + 1 < n) { const e = src[i + 1]; s += e === 't' ? '\t' : e === 'n' ? '\n' : e === '\\' ? '\\' : e === '"' ? '"' : e; i += 2; }
+        else { s += src[i]; i++; }
+      }
+      if (src[i] !== '"') throw new Error('Unterminated string literal');
+      i++; tokens.push({ type: 'STRING', value: s }); continue;
+    }
+    if (/\d/.test(c)) { let m = /^\d+(\.\d+)?/.exec(src.slice(i)); tokens.push({ type: 'NUMBER', value: parseFloat(m[0]) }); i += m[0].length; continue; }
+    if (c === '/' && (prevType() === '~' || prevType() === '!~')) {
+      i++; let s = '';
+      while (i < n && src[i] !== '/') { if (src[i] === '\\' && i + 1 < n) { s += src[i] + src[i + 1]; i += 2; } else { s += src[i]; i++; } }
+      if (src[i] !== '/') throw new Error('Unterminated regex literal');
+      i++; let flags = ''; while (i < n && /[a-z]/i.test(src[i])) { flags += src[i]; i++; }
+      tokens.push({ type: 'REGEX', value: s, flags }); continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i)); const word = m[0]; i += word.length;
+      if (word === 'print') tokens.push({ type: 'PRINT' });
+      else if (word === 'NR') tokens.push({ type: 'NR' });
+      else if (word === 'NF') tokens.push({ type: 'NF' });
+      else tokens.push({ type: 'IDENT', value: word });
+      continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (['==', '!=', '!~', '&&', '||', '<=', '>='].includes(two)) { tokens.push({ type: two }); i += 2; continue; }
+    if ('~<>(){},;!'.includes(c)) { tokens.push({ type: c }); i++; continue; }
+    throw new Error(`Unexpected character '${c}' in awk program`);
+  }
+  tokens.push({ type: 'EOF' });
+  return tokens;
+}
+function parseAwkProgram(src) {
+  const tokens = lexAwk(src); let pos = 0;
+  const peek = () => tokens[pos]; const next = () => tokens[pos++];
+  const expect = (type) => { if (peek().type !== type) throw new Error(`Expected '${type}' but got '${peek().type}'`); return next(); };
+  function parsePrimary() {
+    const t = peek();
+    if (t.type === 'FIELD') { next(); return { kind: 'field', index: { kind: 'num', value: t.value } }; }
+    if (t.type === 'FIELDEXPR') { next(); if (t.value !== 'NF') throw new Error('Only $NF supported as named field'); return { kind: 'field', index: { kind: 'nf' } }; }
+    if (t.type === 'NUMBER') { next(); return { kind: 'num', value: t.value }; }
+    if (t.type === 'STRING') { next(); return { kind: 'str', value: t.value }; }
+    if (t.type === 'REGEX') { next(); return { kind: 'regexlit', value: t.value, flags: t.flags }; }
+    if (t.type === 'NR') { next(); return { kind: 'nr' }; }
+    if (t.type === 'NF') { next(); return { kind: 'nfval' }; }
+    if (t.type === '(') { next(); const e = parseOr(); expect(')'); return e; }
+    if (t.type === '!') { next(); return { kind: 'not', expr: parseUnary() }; }
+    throw new Error(`Unexpected token '${t.type}' in expression`);
+  }
+  function parseUnary() { if (peek().type === '!') { next(); return { kind: 'not', expr: parseUnary() }; } return parsePrimary(); }
+  function startsPrimary(t) { return ['FIELD', 'FIELDEXPR', 'NUMBER', 'STRING', 'REGEX', 'NR', 'NF', '(', '!'].includes(t.type); }
+  function parseConcat() { let node = parseUnary(); const parts = [node]; while (startsPrimary(peek())) parts.push(parseUnary()); return parts.length === 1 ? parts[0] : { kind: 'concat', parts }; }
+  function parseComparison() {
+    let left = parseConcat(); const t = peek();
+    if (['==', '!=', '~', '!~', '<', '<=', '>', '>='].includes(t.type)) { next(); const right = parseConcat(); return { kind: 'cmp', op: t.type, left, right }; }
+    return left;
+  }
+  function parseAnd() { let left = parseComparison(); while (peek().type === '&&') { next(); left = { kind: 'and', left, right: parseComparison() }; } return left; }
+  function parseOr() { let left = parseAnd(); while (peek().type === '||') { next(); left = { kind: 'or', left, right: parseAnd() }; } return left; }
+
+  let pattern = null, action = null;
+  if (peek().type !== '{') pattern = parseOr();
+  if (peek().type === '{') {
+    next();
+    if (peek().type === 'PRINT') {
+      next(); const args = [];
+      if (peek().type !== '}' && peek().type !== ';') { args.push(parseOr()); while (peek().type === ',') { next(); args.push(parseOr()); } }
+      action = { kind: 'print', args };
+    } else if (peek().type === '}') { action = { kind: 'noop' }; }
+    else throw new Error('Only `print` statements are supported inside { }');
+    if (peek().type === ';') next();
+    expect('}');
+  }
+  if (!pattern && !action) throw new Error('Empty awk program');
+  if (pattern && !action) action = { kind: 'print', args: [] };
+  if (!pattern && action) pattern = { kind: 'num', value: 1 };
+  return { pattern, action };
+}
+function awkLooksNumeric(s) { return /^-?\d+(\.\d+)?$/.test(s); }
+function awkToBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (v === '') return false;
+  if (awkLooksNumeric(v)) return parseFloat(v) !== 0;
+  return true;
+}
+function evalAwkNode(node, ctx) {
+  switch (node.kind) {
+    case 'num': return String(node.value);
+    case 'str': return node.value;
+    case 'nr': return String(ctx.nr);
+    case 'nfval': return String(ctx.fields.length);
+    case 'field': {
+      let idx = node.index.kind === 'nf' ? ctx.fields.length : node.index.value;
+      if (idx === 0) return ctx.line;
+      return ctx.fields[idx - 1] !== undefined ? ctx.fields[idx - 1] : '';
+    }
+    case 'concat': return node.parts.map(p => evalAwkNode(p, ctx)).join('');
+    case 'not': return !awkToBool(evalAwkNode(node.expr, ctx));
+    case 'and': return awkToBool(evalAwkNode(node.left, ctx)) && awkToBool(evalAwkNode(node.right, ctx));
+    case 'or': return awkToBool(evalAwkNode(node.left, ctx)) || awkToBool(evalAwkNode(node.right, ctx));
+    case 'cmp': {
+      if (node.op === '~' || node.op === '!~') {
+        const left = evalAwkNode(node.left, ctx);
+        const re = node.right.kind === 'regexlit' ? new RegExp(node.right.value, node.right.flags || '') : new RegExp(String(evalAwkNode(node.right, ctx)));
+        const m = re.test(left);
+        return node.op === '~' ? m : !m;
+      }
+      const l = evalAwkNode(node.left, ctx), r = evalAwkNode(node.right, ctx);
+      const cmp = (awkLooksNumeric(l) && awkLooksNumeric(r)) ? (parseFloat(l) - parseFloat(r)) : (l < r ? -1 : l > r ? 1 : 0);
+      switch (node.op) { case '==': return cmp === 0; case '!=': return cmp !== 0; case '<': return cmp < 0; case '<=': return cmp <= 0; case '>': return cmp > 0; case '>=': return cmp >= 0; }
+    }
+  }
+  throw new Error('Unknown AST node: ' + node.kind);
+}
+function runAwk(programSrc, lines) {
+  const ast = parseAwkProgram(programSrc);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fields = line.trim().length ? line.trim().split(/\s+/) : [];
+    const ctx = { line, fields, nr: i + 1 };
+    if (awkToBool(evalAwkNode(ast.pattern, ctx))) {
+      if (ast.action.kind === 'noop') continue;
+      if (ast.action.args.length === 0) { out.push(line); continue; }
+      out.push(ast.action.args.map(a => evalAwkNode(a, ctx)).join(' '));
+    }
+  }
+  return out;
+}
+function applySort(lines, args) {
+  const flags = args.join(''); const numeric = flags.includes('n'); const reverse = flags.includes('r'); const unique = flags.includes('u');
+  let arr = lines.slice();
+  arr.sort((a, b) => {
+    if (numeric) { const na = parseFloat(a) || 0, nb = parseFloat(b) || 0; if (na !== nb) return na - nb; return a < b ? -1 : a > b ? 1 : 0; }
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  if (reverse) arr.reverse();
+  if (unique) { const seen = new Set(); arr = arr.filter(l => (seen.has(l) ? false : (seen.add(l), true))); }
+  return arr;
+}
+function applyUniq(lines, args) {
+  const withCount = args.includes('-c'); const out = []; let i = 0;
+  while (i < lines.length) {
+    let j = i + 1; while (j < lines.length && lines[j] === lines[i]) j++;
+    out.push(withCount ? `${String(j - i).padStart(4)} ${lines[i]}` : lines[i]);
+    i = j;
+  }
+  return out;
+}
+function applyHeadTail(lines, args, fromEnd) {
+  let n = 10; const joined = args.join(' '); const m = /-n\s*(\d+)/.exec(joined) || /-(\d+)/.exec(joined);
+  if (m) n = parseInt(m[1], 10);
+  return fromEnd ? lines.slice(Math.max(0, lines.length - n)) : lines.slice(0, n);
+}
+function applyGrep(lines, args) {
+  const invert = args.includes('-v'); const icase = args.includes('-i');
+  const pattern = args.filter(a => a !== '-v' && a !== '-i').join(' ');
+  const re = new RegExp(pattern, icase ? 'i' : '');
+  return lines.filter(l => invert ? !re.test(l) : re.test(l));
+}
+function runQueryPipeline(input, rawLines) {
+  const stages = awkSplitTopLevel(input, '|');
+  if (!stages.length) throw new Error('Empty command');
+  let first = stages[0].trim();
+  if (/^awk\b/.test(first)) first = first.replace(/^awk\s*/, '');
+  first = awkStripQuotes(first);
+  let lines = runAwk(first, rawLines);
+  for (let s = 1; s < stages.length; s++) {
+    const argv = awkTokenizeArgs(stages[s]); const cmd = argv[0]; const args = argv.slice(1);
+    if (cmd === 'sort') lines = applySort(lines, args);
+    else if (cmd === 'uniq') lines = applyUniq(lines, args);
+    else if (cmd === 'head') lines = applyHeadTail(lines, args, false);
+    else if (cmd === 'tail') lines = applyHeadTail(lines, args, true);
+    else if (cmd === 'grep') lines = applyGrep(lines, args);
+    else if (cmd === 'wc') lines = [String(lines.length)];
+    else throw new Error(`Unsupported pipeline command '${cmd}' (supported: sort, uniq, head, tail, grep, wc)`);
+  }
+  return lines;
+}
+
 /* ---------- Upload wiring ---------- */
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const uploadStatus = document.getElementById('uploadStatus');
+let currentRawLines = [];
 
 function setStatus(msg, cls) {
   uploadStatus.textContent = msg;
   uploadStatus.className = cls || '';
+}
+function setQueryEnabled(enabled, badgeText) {
+  document.getElementById('queryInput').disabled = !enabled;
+  document.getElementById('runQueryBtn').disabled = !enabled;
+  document.getElementById('nlInput').disabled = !enabled;
+  document.getElementById('nlTranslateBtn').disabled = !enabled;
+  document.getElementById('queryBadge').textContent = badgeText;
+  document.getElementById('queryBadge').style.background = enabled ? 'color-mix(in srgb, var(--good) 20%, transparent)' : 'var(--gridline)';
+  document.getElementById('queryBadge').style.color = enabled ? 'var(--good)' : 'var(--text-muted)';
+  if (enabled) document.getElementById('queryInput').placeholder = "awk '$2==\"r\" {print $14}' | sort | uniq -c | sort -rn";
 }
 
 async function handleFiles(fileList) {
@@ -703,9 +988,11 @@ async function handleFiles(fileList) {
   try {
     const texts = await Promise.all(files.map(f => f.text()));
     const combined = texts.join('\n');
-    const { rLines, fLines } = parseLogText(combined);
+    const { lines, rLines, fLines } = parseLogText(combined);
+    currentRawLines = lines;
+    setQueryEnabled(lines.length > 0, `${lines.length} lines loaded`);
     if (rLines.length === 0) {
-      setStatus(`No recognized records found. This tool expects the Akamai edge/WAF delivery log format (space-delimited, record type 'r' or 'f' at field 2). Parsed ${files.length} file(s), 0 usable lines.`, 'error');
+      setStatus(`No recognized Akamai r/f records found for the KPI dashboard, but ${lines.length} raw lines are loaded — the Custom Query box below will still work on them. Parsed ${files.length} file(s).`, 'error');
       return;
     }
     const result = analyze(rLines, fLines);
@@ -721,11 +1008,216 @@ fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
 document.getElementById('resetBtn').addEventListener('click', () => {
   renderAll(SAMPLE_DATA);
   fileInput.value = '';
+  currentRawLines = [];
+  setQueryEnabled(false, 'no file loaded');
+  document.getElementById('queryInput').value = '';
+  document.getElementById('nlInput').value = '';
+  document.getElementById('nlExplain').textContent = '';
+  document.getElementById('queryOutput').textContent = '';
+  document.getElementById('queryStatus').textContent = '';
+  document.getElementById('downloadQueryBtn').style.display = 'none';
   setStatus('Showing sample data.');
 });
 ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.add('dragover'); }));
 ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.remove('dragover'); }));
 dropZone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files));
+
+/* ---------- Plain-English -> AWK translator (pattern-based, no AI) ---------- */
+/* Deterministic keyword/regex heuristics only. Everything stays client-side,
+   nothing is sent anywhere. Field positions are 1-indexed to match the
+   `r`-type record layout documented in the Parsing engine section above. */
+const NL_FIELD = { ip: 11, method: 12, uri: 13, status: 14, reason: 15, host: 18, ua: 21, latency: 4 };
+function nlEscapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function translateEnglish(text) {
+  const q = text.toLowerCase().trim();
+  if (!q) return null;
+  const filters = [];           // AND-ed boolean clauses (each a complete expr)
+  const statusAlternatives = []; // OR-ed among themselves, then AND-ed as one clause
+  const notes = [];
+
+  // Extract IP first and mask it out before scanning for status-code-shaped
+  // numbers, so octets like the "143"/"244"/"168" in an IP never get read as
+  // HTTP status codes.
+  const ipMatch = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/);
+  const qMasked = ipMatch ? q.replace(ipMatch[0], ' '.repeat(ipMatch[0].length)) : q;
+
+  const STATUS_CLASS = { '2xx': [200, 299], '3xx': [300, 399], '4xx': [400, 499], '5xx': [500, 599] };
+  for (const cls in STATUS_CLASS) {
+    if (qMasked.includes(cls)) {
+      const [lo, hi] = STATUS_CLASS[cls];
+      statusAlternatives.push(`($14>=${lo} && $14<=${hi})`);
+      notes.push(`status class ${cls}`);
+    }
+  }
+  const codeMatches = [...qMasked.matchAll(/\b([1-5]\d{2})s?\b/g)].map(m => m[1]);
+  const uniqueCodes = [...new Set(codeMatches)];
+  if (uniqueCodes.length) {
+    statusAlternatives.push(uniqueCodes.length === 1 ? `$14=="${uniqueCodes[0]}"` : '(' + uniqueCodes.map(c => `$14=="${c}"`).join(' || ') + ')');
+    notes.push(`status ${uniqueCodes.join(', ')}`);
+  }
+  if (/\bblock(ed)?\b|\bdenied\b|\bwaf\b/.test(q) && !uniqueCodes.length) {
+    statusAlternatives.push(`$14=="403"`);
+    notes.push('WAF-blocked (403)');
+  }
+  if (/\brate.?limit|\bchalleng/.test(q) && !uniqueCodes.includes('429')) {
+    statusAlternatives.push(`$14=="429"`);
+    notes.push('rate-limited/challenged (429)');
+  }
+  let mentionsErrorGeneric = false;
+  if (/\berror(s)?\b/.test(q) && !statusAlternatives.length) {
+    filters.push(`$15!="-"`);
+    notes.push('has an error/WAF reason');
+    mentionsErrorGeneric = true;
+  }
+  if (statusAlternatives.length) {
+    filters.push(statusAlternatives.length === 1 ? statusAlternatives[0] : '(' + statusAlternatives.join(' || ') + ')');
+  }
+
+  const methodMatch = q.match(/\b(get|post|put|delete|head|patch)\b/);
+  if (methodMatch) { filters.push(`$12=="${methodMatch[1].toUpperCase()}"`); notes.push(`method ${methodMatch[1].toUpperCase()}`); }
+
+  if (ipMatch) { filters.push(`$11=="${ipMatch[0]}"`); notes.push(`client IP ${ipMatch[0]}`); }
+
+  const hostMatch = !ipMatch && text.match(/\b(?!\d+\.\d)[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+){2,}\b/);
+  if (hostMatch) { filters.push(`$18~/${nlEscapeRegex(hostMatch[0])}/`); notes.push(`host contains ${hostMatch[0]}`); }
+
+  if (/env file|\.env\b|secret scan|config file scan/.test(q)) {
+    filters.push(`$13~/\\.env|\\.git|next\\.config/`);
+    notes.push('env/config-file scan pattern');
+  }
+  if (/path traversal|directory traversal/.test(q)) {
+    filters.push(`$13~/\\.\\.|%2e%2e/`);
+    notes.push('path traversal pattern');
+  }
+  const containingMatch = q.match(/contain(?:ing|s)?\s+["']?([a-z0-9_./-]+)["']?/);
+  if (containingMatch) { filters.push(`$13~/${nlEscapeRegex(containingMatch[1])}/`); notes.push(`URI contains "${containingMatch[1]}"`); }
+
+  const FIELD_KEYWORDS = [
+    { re: /\barl(s)?\b|\burl(s)?\b|\buri(s)?\b|\bpath(s)?\b|\bendpoint(s)?\b|\bresource(s)?\b/, idx: NL_FIELD.uri, label: 'URI/ARL' },
+    { re: /\bip(s)?\b|\bclient(s)?\b|\baddress(es)?\b/, idx: NL_FIELD.ip, label: 'client IP' },
+    { re: /\bstatus(es)?\b|\bcode(s)?\b|\bresponse code(s)?\b/, idx: NL_FIELD.status, label: 'status' },
+    { re: /\bmethod(s)?\b|\bverb(s)?\b/, idx: NL_FIELD.method, label: 'method' },
+    { re: /\bhost(s)?\b|\bdomain(s)?\b/, idx: NL_FIELD.host, label: 'host' },
+    { re: /\breason(s)?\b|\berror message(s)?\b|\bwaf reason(s)?\b/, idx: NL_FIELD.reason, label: 'reason' },
+    { re: /\buser.?agent(s)?\b|\bua\b|\bbrowser(s)?\b/, idx: NL_FIELD.ua, label: 'user-agent' },
+    { re: /\blatenc(y|ies)\b|\bresponse time(s)?\b|\bduration(s)?\b/, idx: NL_FIELD.latency, label: 'latency(ms)' },
+  ];
+  let fields = FIELD_KEYWORDS.filter(fk => fk.re.test(q));
+  const seenIdx = new Set();
+  fields = fields.filter(f => (seenIdx.has(f.idx) ? false : (seenIdx.add(f.idx), true)));
+  const hadExplicitFields = fields.length > 0;
+
+  const wantsTotalCount = /\bhow many\b|\btotal (number|count)\b/.test(q) && !hadExplicitFields;
+  const topMatch = q.match(/\btop\s+(\d+)\b/);
+  const slowest = /\bslowest\b|\bhighest latenc/.test(q);
+
+  // Decide recognizability using ONLY what was explicitly found — must happen
+  // before any default-field fallback below, otherwise every query would
+  // "recognize" via the URI default and nothing could ever fall through.
+  const recognizedSomething = filters.length || hadExplicitFields || topMatch || wantsTotalCount || slowest ||
+    /\b(count|unique|distinct|top)\b/.test(q);
+  if (!recognizedSomething) return null;
+
+  if (!hadExplicitFields && mentionsErrorGeneric) fields = [FIELD_KEYWORDS[2], FIELD_KEYWORDS[5], FIELD_KEYWORDS[0]];
+  if (!fields.length && !wantsTotalCount) fields = [FIELD_KEYWORDS[0]];
+  if (slowest) fields = [FIELD_KEYWORDS[7], ...fields.filter(f => f.idx !== NL_FIELD.latency)];
+
+  let topN = topMatch ? parseInt(topMatch[1], 10) : null;
+  let mode;
+  if (wantsTotalCount) mode = 'totalcount';
+  else if (slowest) { mode = 'sortlatency'; if (!topN) topN = 10; }
+  else if (topMatch) mode = 'count';
+  else if (/\bcount\b|\btally\b|\bgroup(ed)? by\b|\bbreakdown\b/.test(q)) mode = 'count';
+  else if (/\bunique\b|\bdistinct\b/.test(q)) mode = 'unique';
+  else if (/\braw\b|\beach line\b|\bevery (line|request)\b|\ball lines\b/.test(q)) mode = 'raw';
+  else mode = 'count';
+
+  const pattern = ['$2=="r"', ...filters].join(' && ');
+  let command;
+  if (mode === 'totalcount') {
+    command = `awk '${pattern}' | wc -l`;
+  } else {
+    const printExpr = fields.map(f => `$${f.idx}`).join(' "\\t" ');
+    command = `awk '${pattern} {print ${printExpr}}'`;
+    if (mode === 'count') { command += ' | sort | uniq -c | sort -rn'; if (topN) command += ` | head -${topN}`; }
+    else if (mode === 'unique') command += ' | sort -u';
+    else if (mode === 'sortlatency') { command += ' | sort -rn'; if (topN) command += ` | head -${topN}`; }
+  }
+
+  const fieldLabel = wantsTotalCount ? 'total matching lines' : fields.map(f => f.label).join(' + ');
+  const explanation = `Showing ${fieldLabel}` + (notes.length ? `, filtered by: ${notes.join('; ')}` : '') + ` · mode: ${mode}` + (topN ? ` (top ${topN})` : '');
+  return { command, explanation };
+}
+
+/* ---------- Custom query wiring ---------- */
+let lastQueryOutput = [];
+function runCustomQuery() {
+  const input = document.getElementById('queryInput').value.trim();
+  const statusEl = document.getElementById('queryStatus');
+  const outEl = document.getElementById('queryOutput');
+  const dlBtn = document.getElementById('downloadQueryBtn');
+  if (!input) { statusEl.textContent = ''; outEl.textContent = ''; dlBtn.style.display = 'none'; return; }
+  if (!currentRawLines.length) { statusEl.textContent = 'Upload a log file first.'; statusEl.style.color = 'var(--critical)'; return; }
+  try {
+    const out = runQueryPipeline(input, currentRawLines);
+    lastQueryOutput = out;
+    const CAP = 5000;
+    outEl.textContent = out.slice(0, CAP).join('\n') || '(no matching lines)';
+    statusEl.style.color = 'var(--text-muted)';
+    statusEl.textContent = out.length > CAP ? `${out.length} output lines (showing first ${CAP} — use Download for the rest)` : `${out.length} output line(s)`;
+    dlBtn.style.display = out.length ? 'inline-flex' : 'none';
+  } catch (err) {
+    lastQueryOutput = [];
+    outEl.textContent = '';
+    statusEl.style.color = 'var(--critical)';
+    statusEl.textContent = 'Error: ' + err.message;
+    dlBtn.style.display = 'none';
+  }
+}
+document.getElementById('runQueryBtn').addEventListener('click', runCustomQuery);
+function runNlTranslate() {
+  const nlInput = document.getElementById('nlInput');
+  const explainEl = document.getElementById('nlExplain');
+  if (nlInput.disabled) return;
+  const text = nlInput.value.trim();
+  if (!text) { explainEl.textContent = ''; return; }
+  const result = translateEnglish(text);
+  if (!result) {
+    explainEl.style.color = 'var(--critical)';
+    explainEl.textContent = "Couldn't confidently interpret that — try mentioning a field (ARL/URI, IP, status, host, method, latency) and optionally a filter (a status code, GET, blocked, an IP, a host). Or write AWK directly in Advanced below.";
+    return;
+  }
+  document.getElementById('queryInput').value = result.command;
+  explainEl.style.color = 'var(--text-muted)';
+  explainEl.textContent = `Interpreted as: ${result.explanation} — ran: ${result.command}`;
+  runCustomQuery();
+}
+document.getElementById('nlTranslateBtn').addEventListener('click', runNlTranslate);
+document.getElementById('nlInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') runNlTranslate(); });
+document.getElementById('clearQueryBtn').addEventListener('click', () => {
+  document.getElementById('queryInput').value = '';
+  document.getElementById('queryOutput').textContent = '';
+  document.getElementById('queryStatus').textContent = '';
+  document.getElementById('downloadQueryBtn').style.display = 'none';
+});
+document.getElementById('queryInput').addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runCustomQuery();
+});
+document.querySelectorAll('[data-example]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (document.getElementById('queryInput').disabled) return;
+    document.getElementById('queryInput').value = btn.dataset.example;
+    runCustomQuery();
+  });
+});
+document.getElementById('downloadQueryBtn').addEventListener('click', () => {
+  const blob = new Blob([lastQueryOutput.join('\n') + '\n'], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'query-output.txt'; a.click();
+  URL.revokeObjectURL(url);
+});
 
 /* ---------- Initial render ---------- */
 renderAll(SAMPLE_DATA);
