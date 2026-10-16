@@ -28,6 +28,10 @@ record-type marker (`r` = client-facing request, `f` = origin/forward leg) at
 field index 1. If your file doesn't match this shape, the tool will tell you
 rather than silently showing garbage.
 
+The full documented column list for both record types is in
+[`log-line-fields.pdf`](./log-line-fields.pdf) (also linked from the Custom
+Query panel in the app).
+
 ## Tech
 
 Vanilla HTML/CSS/JS + [Chart.js](https://www.chartjs.org/) via CDN. Everything —
