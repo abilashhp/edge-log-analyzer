@@ -103,6 +103,18 @@
   #uploadStatus { font-size: 12px; color: var(--text-muted); width: 100%; margin-top: 4px; }
   #uploadStatus.error { color: var(--critical); }
   #uploadStatus.success { color: var(--good); }
+  .paste-row { width: 100%; }
+  .paste-row summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+  .paste-row summary:hover { color: var(--text-primary); }
+  #pasteBox {
+    width: 100%; margin-top: 8px; display: flex; flex-direction: column; gap: 8px;
+  }
+  #pasteInput {
+    width: 100%; min-height: 140px; resize: vertical; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px; padding: 10px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--page-plane); color: var(--text-primary);
+  }
+  .paste-actions { display: flex; gap: 8px; }
 
   .kpi-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
   @media (max-width: 1100px) { .kpi-row { grid-template-columns: repeat(3, 1fr); } }
@@ -156,12 +168,23 @@
   <div class="upload-card" id="dropZone">
     <div class="drop-label">
       <strong>Upload raw log file(s) to refresh this dashboard</strong>
-      <span>Drag &amp; drop, or choose files — parsed entirely in your browser, nothing is uploaded anywhere. Supports the Akamai edge/WAF delivery log format (space-delimited records, type <code>r</code>/<code>f</code>).</span>
+      <span>Drag &amp; drop, choose files, or paste raw lines below — parsed entirely in your browser, nothing is uploaded anywhere. Supports the Akamai edge/WAF delivery log format (space-delimited records, type <code>r</code>/<code>f</code>).</span>
       <span id="uploadStatus"></span>
     </div>
     <button class="btn primary" id="chooseBtn">Choose files…</button>
     <button class="btn" id="resetBtn">Reset to sample data</button>
-    <input type="file" id="fileInput" multiple accept=".txt,.log,.csv">
+    <input type="file" id="fileInput" multiple>
+
+    <details class="paste-row">
+      <summary>…or paste raw log lines instead</summary>
+      <div id="pasteBox">
+        <textarea id="pasteInput" placeholder="Paste raw edge/WAF log lines here, one record per line…" spellcheck="false"></textarea>
+        <div class="paste-actions">
+          <button class="btn primary" id="analyzePasteBtn">Analyze pasted lines</button>
+          <button class="btn" id="clearPasteBtn">Clear</button>
+        </div>
+      </div>
+    </details>
   </div>
 
   <div class="kpi-row">
@@ -988,6 +1011,20 @@ function setQueryEnabled(enabled, badgeText) {
   if (enabled) document.getElementById('queryInput').placeholder = "awk '$2==\"r\" {print $14}' | sort | uniq -c | sort -rn";
 }
 
+function analyzeText(combined, sourceLabel) {
+  const { lines, rLines, fLines } = parseLogText(combined);
+  currentRawLines = lines;
+  setQueryEnabled(lines.length > 0, `${lines.length} lines loaded`);
+  if (rLines.length === 0) {
+    setStatus(`No recognized Akamai r/f records found for the KPI dashboard, but ${lines.length} raw lines are loaded — the Custom Query box below will still work on them. ${sourceLabel}, 0 usable KPI lines.`, 'error');
+    return false;
+  }
+  const result = analyze(rLines, fLines);
+  renderAll(result);
+  setStatus(`${sourceLabel} — parsed ${rLines.length} client requests + ${fLines.length} origin legs.`, 'success');
+  return true;
+}
+
 async function handleFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
@@ -995,16 +1032,7 @@ async function handleFiles(fileList) {
   try {
     const texts = await Promise.all(files.map(f => f.text()));
     const combined = texts.join('\n');
-    const { lines, rLines, fLines } = parseLogText(combined);
-    currentRawLines = lines;
-    setQueryEnabled(lines.length > 0, `${lines.length} lines loaded`);
-    if (rLines.length === 0) {
-      setStatus(`No recognized Akamai r/f records found for the KPI dashboard, but ${lines.length} raw lines are loaded — the Custom Query box below will still work on them. Parsed ${files.length} file(s).`, 'error');
-      return;
-    }
-    const result = analyze(rLines, fLines);
-    renderAll(result);
-    setStatus(`Loaded ${files.map(f => f.name).join(', ')} — parsed ${rLines.length} client requests + ${fLines.length} origin legs.`, 'success');
+    analyzeText(combined, `Loaded ${files.map(f => f.name).join(', ')}`);
   } catch (err) {
     setStatus('Failed to parse file(s): ' + err.message, 'error');
   }
@@ -1028,6 +1056,24 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.add('dragover'); }));
 ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.remove('dragover'); }));
 dropZone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files));
+
+const pasteInput = document.getElementById('pasteInput');
+document.getElementById('analyzePasteBtn').addEventListener('click', () => {
+  const text = pasteInput.value;
+  if (!text.trim()) {
+    setStatus('Paste box is empty — add some log lines first.', 'error');
+    return;
+  }
+  try {
+    analyzeText(text, 'Analyzed pasted lines');
+  } catch (err) {
+    setStatus('Failed to parse pasted text: ' + err.message, 'error');
+  }
+});
+document.getElementById('clearPasteBtn').addEventListener('click', () => {
+  pasteInput.value = '';
+  pasteInput.focus();
+});
 
 /* ---------- Plain-English -> AWK translator (pattern-based, no AI) ---------- */
 /* Deterministic keyword/regex heuristics only. Everything stays client-side,
