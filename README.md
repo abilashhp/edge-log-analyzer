@@ -2,14 +2,16 @@
 
 A single-file, client-side dashboard for analyzing CDN/edge/WAF access logs — no server, no build step, no data leaves your browser.
 
-Open `index.html` directly, or drag & drop (or choose) your raw log file(s) to parse them in place.
+Open `index.html` directly, or drag & drop (choose, or paste) your raw log file(s) to parse them in place.
 
 ## What it shows
 
-- KPI cards: total requests, 404 rate, 5xx count, p95 latency, peak RPS, WAF/challenge blocks
-- Requests-per-second and p95-latency timelines
+- KPI cards: total requests, 404 rate, 5xx count, cache hit ratio, total bytes served,
+  WAF info coverage, p95 latency, peak RPS, WAF/challenge blocks
+- Requests-per-second, p95-latency, and bandwidth timelines
 - Response code distribution (2xx/3xx/4xx/5xx)
-- Top failing/blocked endpoints and top slowest endpoints
+- Cache status breakdown (from the Object Status field) and Content-Type distribution
+- Top failing/blocked endpoints, top slowest endpoints, and top WAF info signals
 - A sortable, filterable table of the most active/suspicious client IPs
 - Lightweight security-pattern detection (path traversal, SQLi/XSS probes, config-file scanning)
 - A **Custom Query** box: describe what you want in plain English (e.g. "list ARLs of 301s",
