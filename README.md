@@ -1,5 +1,10 @@
 # Edge Log Analyzer
 
+> **Generated — don't edit `index.html` or `log-line-fields.pdf` here.** They're built from
+> [`public/tools/edge-log-analyzer/`](https://github.com/abilashhp/iamabhilash-site/tree/main/public/tools/edge-log-analyzer)
+> in [iamabhilash-site](https://github.com/abilashhp/iamabhilash-site) and pushed here by a GitHub Action
+> on every change. Direct edits will be overwritten.
+
 A single-file, client-side dashboard for analyzing CDN/edge/WAF access logs — no server, no build step, no data leaves your browser.
 
 Open `index.html` directly, or drag & drop (choose, or paste) your raw log file(s) to parse them in place.
